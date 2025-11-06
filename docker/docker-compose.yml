@@ -1,0 +1,95 @@
+services:
+    node1:
+        build:
+            context: ..
+            dockerfile: docker/Dockerfile
+        container_name: acp-node1
+        environment:
+            - NODE_ID=node1
+            - LISTEN_ADDR=:8080
+            - METRICS_ADDR=:9090
+            - PEERS=node2:8080,node3:8080
+            - QUORUM_R=2
+            - QUORUM_W=2
+            - REPLICATION_TIMEOUT=500ms
+            - HEALTH_PROBE_INTERVAL=500ms
+        ports:
+            - "8080:8080"
+            - "9090:9090"
+        networks:
+            - acp-network
+
+    node2:
+        build:
+            context: ..
+            dockerfile: docker/Dockerfile
+        container_name: acp-node2
+        environment:
+            - NODE_ID=node2
+            - LISTEN_ADDR=:8080
+            - METRICS_ADDR=:9090
+            - PEERS=node1:8080,node3:8080
+            - QUORUM_R=2
+            - QUORUM_W=2
+            - REPLICATION_TIMEOUT=500ms
+            - HEALTH_PROBE_INTERVAL=500ms
+        ports:
+            - "8081:8080"
+            - "9091:9090"
+        networks:
+            - acp-network
+
+    node3:
+        build:
+            context: ..
+            dockerfile: docker/Dockerfile
+        container_name: acp-node3
+        environment:
+            - NODE_ID=node3
+            - LISTEN_ADDR=:8080
+            - METRICS_ADDR=:9090
+            - PEERS=node1:8080,node2:8080
+            - QUORUM_R=2
+            - QUORUM_W=2
+            - REPLICATION_TIMEOUT=500ms
+            - HEALTH_PROBE_INTERVAL=500ms
+        ports:
+            - "8082:8080"
+            - "9092:9090"
+        networks:
+            - acp-network
+
+    prometheus:
+        image: prom/prometheus:latest
+        container_name: acp-prometheus
+        volumes:
+            - ./prometheus.yml:/etc/prometheus/prometheus.yml
+        command:
+            - "--config.file=/etc/prometheus/prometheus.yml"
+            - "--storage.tsdb.path=/prometheus"
+        ports:
+            - "9093:9090"
+        networks:
+            - acp-network
+
+    grafana:
+        image: grafana/grafana:latest
+        container_name: acp-grafana
+        ports:
+            - "3000:3000"
+        environment:
+            - GF_SECURITY_ADMIN_PASSWORD=admin
+            - GF_USERS_ALLOW_SIGN_UP=false
+        volumes:
+            - grafana-storage:/var/lib/grafana
+        networks:
+            - acp-network
+        depends_on:
+            - prometheus
+
+networks:
+    acp-network:
+        driver: bridge
+
+volumes:
+    grafana-storage:
