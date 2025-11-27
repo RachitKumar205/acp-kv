@@ -1,0 +1,107 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: acp-node
+  namespace: default
+spec:
+  replicas: 3
+  serviceName: acp-headless
+  selector:
+    matchLabels:
+      app: acp-node
+  template:
+    metadata:
+      labels:
+        app: acp-node
+    spec:
+      containers:
+      - name: acp-node
+        image: acp-kv:latest
+        imagePullPolicy: Never
+        ports:
+        - containerPort: 8080
+          name: grpc
+          protocol: TCP
+        - containerPort: 9090
+          name: metrics
+          protocol: TCP
+        env:
+        # Node identity (auto-populated from pod name: acp-node-0, acp-node-1, acp-node-2)
+        - name: NODE_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+
+        # Network configuration
+        - name: LISTEN_ADDR
+          value: ":8080"
+        - name: METRICS_ADDR
+          value: ":9090"
+
+        # Initial quorum configuration
+        - name: QUORUM_R
+          value: "2"
+        - name: QUORUM_W
+          value: "2"
+
+        # Adaptive quorum configuration
+        - name: ADAPTIVE_ENABLED
+          value: "true"
+        - name: MIN_R
+          value: "1"
+        - name: MAX_R
+          value: "3"
+        - name: MIN_W
+          value: "2"
+        - name: MAX_W
+          value: "3"
+        - name: ADAPTIVE_INTERVAL
+          value: "2s"
+        - name: CCS_RELAX_THRESHOLD
+          value: "0.75"
+        - name: CCS_TIGHTEN_THRESHOLD
+          value: "0.80"
+
+        # Kubernetes service discovery
+        - name: CLUSTER_SIZE
+          value: "3"
+        - name: HEADLESS_SERVICE
+          value: "acp-headless"
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+
+        # Replication and health configuration
+        - name: REPLICATION_TIMEOUT
+          value: "500ms"
+        - name: HEALTH_PROBE_INTERVAL
+          value: "500ms"
+
+        # HLC and staleness configuration
+        - name: HLC_MAX_DRIFT
+          value: "500ms"
+        - name: MAX_STALENESS
+          value: "3s"
+        - name: RECONCILIATION_ENABLED
+          value: "true"
+        - name: RECONCILIATION_INTERVAL
+          value: "30s"
+
+        readinessProbe:
+          tcpSocket:
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          tcpSocket:
+            port: 8080
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"

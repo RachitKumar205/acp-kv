@@ -28,6 +28,22 @@ type Config struct {
 
 	// metrics
 	MetricsAddr string
+
+	// adaptive quorum configuration
+	AdaptiveEnabled      bool
+	MinR                 int
+	MaxR                 int
+	MinW                 int
+	MaxW                 int
+	AdaptiveInterval     time.Duration
+	CCSRelaxThreshold    float64
+	CCSTightenThreshold  float64
+
+	// hlc and staleness configuration
+	HLCMaxDrift          time.Duration // maximum allowed clock drift
+	MaxStaleness         time.Duration // maximum data age before rejection
+	ReconciliationEnabled bool          // enable reconciliation after partition healing
+	ReconciliationInterval time.Duration // interval for reconciliation checks
 }
 
 // load config from env vars
@@ -40,27 +56,64 @@ func LoadConfig() (*Config, error) {
 		HealthProbeInterval: getDurationEnv("HEALTH_PROBE_INTERVAL", 500*time.Millisecond),
 	}
 
-	// parse peers
-	peersStr := getEnv("PEERS", "")
-	if peersStr != "" {
-		cfg.Peers = strings.Split(peersStr, ",")
-		for i, peer := range cfg.Peers {
-			cfg.Peers[i] = strings.TrimSpace(peer)
+	// k8s peer discovery
+	if headlessSvc := os.Getenv("HEADLESS_SERVICE"); headlessSvc != "" {
+		cfg.Peers = discoverKubernetesPeers(cfg.NodeID, headlessSvc)
+	} else {
+		// fallback
+		peersStr := getEnv("PEERS", "")
+		if peersStr != "" {
+			cfg.Peers = strings.Split(peersStr, ",")
+			for i, peer := range cfg.Peers {
+				cfg.Peers[i] = strings.TrimSpace(peer)
+			}
 		}
 	}
 
 	cfg.N = len(cfg.Peers) + 1
 
-	// parse quorum params
 	cfg.R = getIntEnv("QUORUM_R", 2)
 	cfg.W = getIntEnv("QUORUM_W", 2)
 
-	// valdate
+	// adaptive quorum configuration
+	cfg.AdaptiveEnabled = getBoolEnv("ADAPTIVE_ENABLED", false)
+	cfg.MinR = getIntEnv("MIN_R", 1)
+	cfg.MaxR = getIntEnv("MAX_R", cfg.N)
+	cfg.MinW = getIntEnv("MIN_W", 1)
+	cfg.MaxW = getIntEnv("MAX_W", cfg.N)
+	cfg.AdaptiveInterval = getDurationEnv("ADAPTIVE_INTERVAL", 2*time.Second)
+	cfg.CCSRelaxThreshold = getFloatEnv("CCS_RELAX_THRESHOLD", 0.45)
+	cfg.CCSTightenThreshold = getFloatEnv("CCS_TIGHTEN_THRESHOLD", 0.75)
+
+	// hlc and staleness configuration
+	cfg.HLCMaxDrift = getDurationEnv("HLC_MAX_DRIFT", 500*time.Millisecond)
+	cfg.MaxStaleness = getDurationEnv("MAX_STALENESS", 3*time.Second)
+	cfg.ReconciliationEnabled = getBoolEnv("RECONCILIATION_ENABLED", false)
+	cfg.ReconciliationInterval = getDurationEnv("RECONCILIATION_INTERVAL", 30*time.Second)
+
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 
 	return cfg, nil
+}
+
+func discoverKubernetesPeers(nodeID, headlessSvc string) []string {
+	clusterSize := getIntEnv("CLUSTER_SIZE", 3)
+	namespace := getEnv("NAMESPACE", "default")
+
+	peers := []string{}
+	for i := 0; i < clusterSize; i++ {
+		peerName := fmt.Sprintf("acp-node-%d", i)
+
+		if peerName != nodeID {
+			peerAddr := fmt.Sprintf("%s.%s.%s.svc.cluster.local:8080",
+				peerName, headlessSvc, namespace)
+			peers = append(peers, peerAddr)
+		}
+	}
+
+	return peers
 }
 
 // validation checks for config
@@ -115,4 +168,37 @@ func getDurationEnv(key string, defaultValue time.Duration) time.Duration {
 	}
 
 	return defaultValue
+}
+
+func getBoolEnv(key string, defaultValue bool) bool {
+	if value := os.Getenv(key); value != "" {
+		if boolVal, err := strconv.ParseBool(value); err == nil {
+			return boolVal
+		}
+	}
+
+	return defaultValue
+}
+
+func getFloatEnv(key string, defaultValue float64) float64 {
+	if value := os.Getenv(key); value != "" {
+		if floatVal, err := strconv.ParseFloat(value, 64); err == nil {
+			return floatVal
+		}
+	}
+
+	return defaultValue
+}
+
+// implement quorumprovider interface (for static mode)
+func (c *Config) GetR() int {
+	return c.R
+}
+
+func (c *Config) GetW() int {
+	return c.W
+}
+
+func (c *Config) GetN() int {
+	return c.N
 }

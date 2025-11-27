@@ -20,7 +20,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o acp-node ./cmd/ac
 # runtime stage
 FROM alpine:latest
 
-RUN apk --no-cache add ca-certificates
+# Install network tools for chaos testing
+RUN apk --no-cache add ca-certificates iproute2 iptables
 
 WORKDIR /root/
 

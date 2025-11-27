@@ -53,4 +53,58 @@ install-tools:
 fmt:
 	go fmt ./...
 
+# Build custom adaptive benchmark
+acp-bench:
+	go build -o bin/acp-bench ./cmd/acp-adaptive-bench
+
+# Use the custom adaptive benchmark for testing (recommended)
+ycsb-test:
+	@echo "Note: go-ycsb needs custom build with ACP binding."
+	@echo "Instead, use the custom adaptive benchmark:"
+	@echo "  make acp-bench"
+	@echo "  ./bin/acp-bench --help"
+
+k8s-build:
+	docker build -f docker/Dockerfile -t acp-kv:latest .
+
+k8s-load-kind:
+	kind load docker-image acp-kv:latest --name kind
+
+k8s-deploy:
+	kubectl apply -f k8s/
+
+k8s-delete:
+	kubectl delete -f k8s/
+
+k8s-restart: k8s-delete k8s-deploy
+
+k8s-scale:
+	@read -p "Enter number of replicas: " replicas; \
+	echo "Scaling to $$replicas nodes..."; \
+	kubectl scale statefulset acp-node --replicas=$$replicas && \
+	kubectl set env statefulset/acp-node CLUSTER_SIZE=$$replicas && \
+	echo "Waiting for pods to be ready..." && \
+	kubectl rollout status statefulset acp-node && \
+	echo "✓ Cluster scaled to $$replicas nodes!"
+
+k8s-scale-to:
+	@if [ -z "$(REPLICAS)" ]; then \
+		echo "Usage: make k8s-scale-to REPLICAS=5"; \
+		exit 1; \
+	fi
+	@echo "Scaling to $(REPLICAS) nodes..."
+	@kubectl scale statefulset acp-node --replicas=$(REPLICAS)
+	@kubectl set env statefulset/acp-node CLUSTER_SIZE=$(REPLICAS)
+	@kubectl rollout status statefulset acp-node
+	@echo "✓ Cluster scaled to $(REPLICAS) nodes!"
+
+k8s-logs:
+	kubectl logs -f -l app=acp-node --all-containers=true
+
+k8s-status:
+	kubectl get pods,svc,statefulsets
+
+k8s-port-forward:
+	kubectl port-forward svc/acp-service 8080:8080
+
 .DEFAULT_GOAL := help

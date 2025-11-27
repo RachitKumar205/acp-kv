@@ -4,6 +4,13 @@ package acp;
 
 option go_package = "github.com/rachitkumar205/acp-kv/api/proto";
 
+// hybrid logical clock timestamp
+message HLC {
+    int64 physical = 1;  // physical timestamp in nanoseconds
+    int64 logical = 2;   // logical counter
+    string node_id = 3;  // node that generated timestamp
+}
+
 // acp service - key value store
 service ACPService {
 
@@ -27,7 +34,8 @@ message PutResponse {
     bool success = 1;
     string error = 2;
     int64 version = 3;
-    int64 timestamp = 4;
+    int64 timestamp = 4;  // deprecated, use hlc
+    HLC hlc = 5;          // hybrid logical clock timestamp
 }
 
 // client get request
@@ -39,8 +47,10 @@ message GetResponse {
     bool found = 1;
     bytes value = 2;
     int64 version = 3;
-    int64 timestamp = 4;
+    int64 timestamp = 4;  // deprecated, use hlc
     string error = 5;
+    HLC hlc = 6;          // hybrid logical clock timestamp
+    bool is_stale = 7;    // indicates if data exceeds staleness bound
 }
 
 // inter node replication
@@ -48,8 +58,9 @@ message ReplicateRequest {
     string key = 1;
     bytes value = 2;
     int64 version = 3;
-    int64 timestamp = 4;
+    int64 timestamp = 4;     // deprecated, use hlc
     string source_node_id = 5;
+    HLC hlc = 6;             // hybrid logical clock timestamp
 }
 
 message ReplicateResponse {
@@ -61,11 +72,13 @@ message ReplicateResponse {
 // peer monitoring health check
 message HealthRequest {
     string source_node_id = 1;
-    int64 timestamp = 2;
+    int64 timestamp = 2;  // deprecated, use hlc
+    HLC hlc = 3;          // hybrid logical clock timestamp
 }
 
 message HealthResponse {
     bool healthy = 1;
     string node_id = 2;
-    int64 timestamp = 3;
+    int64 timestamp = 3;  // deprecated, use hlc
+    HLC hlc = 4;          // hybrid logical clock timestamp
 }

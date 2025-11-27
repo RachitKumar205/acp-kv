@@ -7,9 +7,12 @@ import (
 
 	"github.com/rachitkumar205/acp-kv/api/proto"
 	"github.com/rachitkumar205/acp-kv/internal/config"
+	"github.com/rachitkumar205/acp-kv/internal/hlc"
 	"github.com/rachitkumar205/acp-kv/internal/metrics"
+	"github.com/rachitkumar205/acp-kv/internal/reconcile"
 	"github.com/rachitkumar205/acp-kv/internal/replication"
 	"github.com/rachitkumar205/acp-kv/internal/server"
+	"github.com/rachitkumar205/acp-kv/internal/staleness"
 	"github.com/rachitkumar205/acp-kv/internal/storage"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -82,7 +85,12 @@ func TestQuorumEnforcement(t *testing.T) {
 	}
 	defer coordinator.Close()
 
-	srv := server.NewServer(cfg, store, coordinator, logger, m)
+	// initialize required components
+	hlcClock := hlc.NewClock(cfg.NodeID, 500*time.Millisecond)
+	stalenessDetector := staleness.NewDetector(3*time.Second, m)
+	reconciler := reconcile.NewEngine(store, coordinator, 30*time.Second, true, logger, m)
+
+	srv := server.NewServer(cfg.NodeID, store, coordinator, cfg, logger, m, hlcClock, stalenessDetector, reconciler)
 
 	// put should only succeed with local node (w=2 but only 1 node is up so the op should fail)
 	ctx := context.Background()
@@ -119,7 +127,12 @@ func TestConcurrentOperations(t *testing.T) {
 	coordinator, _ := replication.NewCoordinator(cfg.NodeID, []string{}, logger, m, cfg.ReplicationTimeout)
 	defer coordinator.Close()
 
-	srv := server.NewServer(cfg, store, coordinator, logger, m)
+	// initialize required components
+	hlcClock := hlc.NewClock(cfg.NodeID, 500*time.Millisecond)
+	stalenessDetector := staleness.NewDetector(3*time.Second, m)
+	reconciler := reconcile.NewEngine(store, coordinator, 30*time.Second, true, logger, m)
+
+	srv := server.NewServer(cfg.NodeID, store, coordinator, cfg, logger, m, hlcClock, stalenessDetector, reconciler)
 	ctx := context.Background()
 
 	numOps := 50
@@ -171,7 +184,12 @@ func TestHealthCheck(t *testing.T) {
 	coordinator, _ := replication.NewCoordinator(cfg.NodeID, []string{}, logger, m, 500*time.Millisecond)
 	defer coordinator.Close()
 
-	srv := server.NewServer(cfg, store, coordinator, logger, m)
+	// initialize required components
+	hlcClock := hlc.NewClock(cfg.NodeID, 500*time.Millisecond)
+	stalenessDetector := staleness.NewDetector(3*time.Second, m)
+	reconciler := reconcile.NewEngine(store, coordinator, 30*time.Second, true, logger, m)
+
+	srv := server.NewServer(cfg.NodeID, store, coordinator, cfg, logger, m, hlcClock, stalenessDetector, reconciler)
 	ctx := context.Background()
 
 	healthResp, err := srv.HealthCheck(ctx, &proto.HealthRequest{
@@ -206,7 +224,12 @@ func TestReplication(t *testing.T) {
 	coordinator, _ := replication.NewCoordinator(cfg.NodeID, []string{}, logger, m, 500*time.Millisecond)
 	defer coordinator.Close()
 
-	srv := server.NewServer(cfg, store, coordinator, logger, m)
+	// initialize required components
+	hlcClock := hlc.NewClock(cfg.NodeID, 500*time.Millisecond)
+	stalenessDetector := staleness.NewDetector(3*time.Second, m)
+	reconciler := reconcile.NewEngine(store, coordinator, 30*time.Second, true, logger, m)
+
+	srv := server.NewServer(cfg.NodeID, store, coordinator, cfg, logger, m, hlcClock, stalenessDetector, reconciler)
 	ctx := context.Background()
 
 	// test replicatoin

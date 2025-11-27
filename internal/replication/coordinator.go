@@ -3,9 +3,12 @@ package replication
 import (
 	"context"
 	"fmt"
+	"net"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/rachitkumar205/acp-kv/internal/hlc"
 	"github.com/rachitkumar205/acp-kv/internal/metrics"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -16,42 +19,218 @@ import (
 
 // manages replication to peer nodes
 type Coordinator struct {
-	nodeID  string
-	peers   map[string]proto.ACPServiceClient // peer address -> client
-	conns   []*grpc.ClientConn                // track conns
-	logger  *zap.Logger
-	metrics *metrics.Metrics
-	timeout time.Duration
+	nodeID            string
+	peers             map[string]proto.ACPServiceClient // peer address -> client
+	conns             map[string]*grpc.ClientConn       // peer address -> connection
+	configuredPeers   []string                          // full list of configured peer addresses (immutable)
+	logger            *zap.Logger
+	metrics           *metrics.Metrics
+	timeout           time.Duration
+	mu                sync.RWMutex // protect peers and conns maps
 }
 
 func NewCoordinator(nodeID string, peerAddrs []string, logger *zap.Logger, metrics *metrics.Metrics, timeout time.Duration) (*Coordinator, error) {
 	c := &Coordinator{
-		nodeID:  nodeID,
-		peers:   make(map[string]proto.ACPServiceClient),
-		logger:  logger,
-		metrics: metrics,
-		timeout: timeout,
+		nodeID:          nodeID,
+		peers:           make(map[string]proto.ACPServiceClient),
+		conns:           make(map[string]*grpc.ClientConn),
+		configuredPeers: peerAddrs, // store full configured list
+		logger:          logger,
+		metrics:         metrics,
+		timeout:         timeout,
 	}
 
-	// est connections to all pairs
+	// est connections to all peers
 	for _, addr := range peerAddrs {
-		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-
-		if err != nil {
+		if err := c.addPeer(addr); err != nil {
 			logger.Warn("failed to connect to peer", zap.String("peer", addr), zap.Error(err))
-			continue
 		}
-
-		client := proto.NewACPServiceClient(conn)
-		c.peers[addr] = client
-		c.conns = append(c.conns, conn)
-		logger.Info("connected to peer", zap.String("peer", addr))
 	}
 
 	return c, nil
 }
 
+func (c *Coordinator) addPeer(addr string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// check if already connected
+	if _, exists := c.peers[addr]; exists {
+		return nil
+	}
+
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return err
+	}
+
+	client := proto.NewACPServiceClient(conn)
+	c.peers[addr] = client
+	c.conns[addr] = conn
+	c.logger.Info("connected to peer", zap.String("peer", addr))
+	return nil
+}
+
+func (c *Coordinator) removePeer(addr string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if conn, exists := c.conns[addr]; exists {
+		conn.Close()
+		delete(c.peers, addr)
+		delete(c.conns, addr)
+		c.logger.Info("removed peer", zap.String("peer", addr))
+	}
+}
+
+// uses dns lookup to find all running pods
+func DiscoverPeersDNS(nodeID, headlessSvc, namespace string) ([]string, error) {
+	fqdn := fmt.Sprintf("%s.%s.svc.cluster.local", headlessSvc, namespace)
+
+	// lookuphost returns ips of all ready pods
+	ips, err := net.LookupHost(fqdn)
+	if err != nil {
+		return nil, fmt.Errorf("dns lookup failed for %s: %w", fqdn, err)
+	}
+
+	peers := []string{}
+	headlessPattern := fmt.Sprintf(".%s.%s.svc.cluster.local", headlessSvc, namespace)
+
+	for _, ip := range ips {
+		// reverse lookup to get pod name
+		names, err := net.LookupAddr(ip)
+		if err != nil || len(names) == 0 {
+			// if reverse lookup fails, skip
+			continue
+		}
+
+		// find the statefulset pod name (not the ip-based service name)
+		// names contains entries like:
+		//   "acp-node-2.acp-headless.default.svc.cluster.local."
+		//   "10-244-0-44.acp-service.default.svc.cluster.local."
+		// we want the one matching the headless service
+		var podFQDN string
+		for _, name := range names {
+			if strings.Contains(name, headlessPattern) {
+				podFQDN = name
+				break
+			}
+		}
+
+		if podFQDN == "" {
+			continue // no valid pod name found
+		}
+
+		// extract pod name from fqdn
+		parts := strings.Split(podFQDN, ".")
+		if len(parts) < 2 {
+			continue
+		}
+
+		podName := parts[0] // "acp-node-0"
+		if podName == nodeID {
+			continue // skip self
+		}
+
+		// construct full peer address
+		peerAddr := fmt.Sprintf("%s.%s.%s.svc.cluster.local:8080",
+			podName, headlessSvc, namespace)
+		peers = append(peers, peerAddr)
+	}
+
+	return peers, nil
+}
+
+func (c *Coordinator) reconcilePeers(newPeerAddrs []string) {
+	newPeerSet := make(map[string]bool)
+	for _, addr := range newPeerAddrs {
+		newPeerSet[addr] = true
+	}
+
+	// get current peers
+	c.mu.RLock()
+	currentPeers := make([]string, 0, len(c.peers))
+	for addr := range c.peers {
+		currentPeers = append(currentPeers, addr)
+	}
+	c.mu.RUnlock()
+
+	// remove peers that no longer exist
+	for _, addr := range currentPeers {
+		if !newPeerSet[addr] {
+			c.removePeer(addr)
+		}
+	}
+
+	// add new peers
+	for addr := range newPeerSet {
+		c.mu.RLock()
+		_, exists := c.peers[addr]
+		c.mu.RUnlock()
+
+		if !exists {
+			if err := c.addPeer(addr); err != nil {
+				c.logger.Warn("failed to connect to new peer",
+					zap.String("peer", addr),
+					zap.Error(err))
+			}
+		}
+	}
+}
+
+func (c *Coordinator) StartPeerDiscovery(ctx context.Context, nodeID, headlessSvc, namespace string, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	c.logger.Info("starting peer discovery",
+		zap.String("method", "dns"),
+		zap.Duration("interval", interval))
+
+	for {
+		select {
+		case <-ticker.C:
+			peers, err := DiscoverPeersDNS(nodeID, headlessSvc, namespace)
+			if err != nil {
+				c.logger.Warn("peer discovery failed", zap.Error(err))
+				continue
+			}
+
+			c.logger.Debug("discovered peers",
+				zap.Int("count", len(peers)),
+				zap.Strings("peers", peers))
+
+			c.reconcilePeers(peers)
+
+		case <-ctx.Done():
+			c.logger.Info("peer discovery stopped")
+			return
+		}
+	}
+}
+
+// getpeeraddresses returns list of all current peer addresses
+func (c *Coordinator) GetPeerAddresses() []string {
+	// Return full configured peer list, not just connected peers
+	// This ensures CCS calculation uses N=total_cluster_size, not just reachable peers
+	return c.configuredPeers
+}
+
+// GetConnectedPeerAddresses returns only currently connected peers
+func (c *Coordinator) GetConnectedPeerAddresses() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	addrs := make([]string, 0, len(c.peers))
+	for addr := range c.peers {
+		addrs = append(addrs, addr)
+	}
+	return addrs
+}
+
 func (c *Coordinator) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	for _, conn := range c.conns {
 		if err := conn.Close(); err != nil {
 			c.logger.Warn("failed to close connection", zap.Error(err))
@@ -70,17 +249,25 @@ type ReplicateResult struct {
 }
 
 // send replication requests to all peers and wait for W acks
-func (c *Coordinator) Replicate(ctx context.Context, key string, value []byte, version, timestamp int64, requiredAcks int) (int, []ReplicateResult, error) {
-	if len(c.peers) == 0 {
+func (c *Coordinator) Replicate(ctx context.Context, key string, value []byte, version, timestamp int64, hlcTimestamp hlc.HLC, requiredAcks int) (int, []ReplicateResult, error) {
+	// get snapshot of current peers
+	c.mu.RLock()
+	peerList := make(map[string]proto.ACPServiceClient, len(c.peers))
+	for addr, client := range c.peers {
+		peerList[addr] = client
+	}
+	c.mu.RUnlock()
+
+	if len(peerList) == 0 {
 		// no peers, only self acknowledgement
 		return 1, []ReplicateResult{}, nil
 	}
 
-	results := make(chan ReplicateResult, len(c.peers))
+	results := make(chan ReplicateResult, len(peerList))
 	var wg sync.WaitGroup
 
 	//send replication requests to all peers in parallel
-	for addr, client := range c.peers {
+	for addr, client := range peerList {
 		wg.Add(1)
 		go func(peerAddr string, peerClient proto.ACPServiceClient) {
 			defer wg.Done()
@@ -95,6 +282,7 @@ func (c *Coordinator) Replicate(ctx context.Context, key string, value []byte, v
 				Version:      version,
 				Timestamp:    timestamp,
 				SourceNodeId: c.nodeID,
+				Hlc:          hlcTimestamp.ToProto(),
 			}
 
 			resp, err := peerClient.Replicate(repCtx, req)
@@ -160,7 +348,7 @@ func (c *Coordinator) Replicate(ctx context.Context, key string, value []byte, v
 		zap.String("key", key),
 		zap.Int("success_count", successCount),
 		zap.Int("required_acks", requiredAcks),
-		zap.Int("total_peers", len(c.peers)))
+		zap.Int("total_peers", len(peerList)))
 
 	if successCount < requiredAcks {
 		return successCount, allResults, fmt.Errorf("insufficient acknowledgements: got %d, need %d", successCount, requiredAcks)
@@ -171,18 +359,26 @@ func (c *Coordinator) Replicate(ctx context.Context, key string, value []byte, v
 
 // query R replicas for a key and return all versions
 func (c *Coordinator) QueryReplicas(ctx context.Context, key string, requiredResponses int) ([]ReplicaValue, error) {
-	if len(c.peers) == 0 {
+	// get snapshot of current peers
+	c.mu.RLock()
+	peerList := make(map[string]proto.ACPServiceClient, len(c.peers))
+	for addr, client := range c.peers {
+		peerList[addr] = client
+	}
+	c.mu.RUnlock()
+
+	if len(peerList) == 0 {
 		if requiredResponses > 1 {
 			return nil, fmt.Errorf("insufficient replicas: need %d, have only self", requiredResponses)
 		}
 		return []ReplicaValue{}, nil
 	}
 
-	results := make(chan ReplicaValue, len(c.peers))
+	results := make(chan ReplicaValue, len(peerList))
 	var wg sync.WaitGroup
 
 	// query all peers parallel
-	for addr, client := range c.peers {
+	for addr, client := range peerList {
 		wg.Add(1)
 		go func(peerAddr string, peerClient proto.ACPServiceClient) {
 			defer wg.Done()
@@ -208,6 +404,8 @@ func (c *Coordinator) QueryReplicas(ctx context.Context, key string, requiredRes
 					Value:     resp.Value,
 					Version:   resp.Version,
 					Timestamp: resp.Timestamp,
+					HLC:       hlc.FromProto(resp.Hlc),
+					IsStale:   resp.IsStale,
 					Found:     true,
 				}
 			}
@@ -242,10 +440,12 @@ type ReplicaValue struct {
 	Value     []byte
 	Version   int64
 	Timestamp int64
+	HLC       hlc.HLC // hybrid logical clock timestamp
+	IsStale   bool    // indicates if data exceeds staleness bound
 	Found     bool
 }
 
-// get most recent val based on timestamp
+// get most recent val based on hlc timestamp (lww using hlc)
 func GetMostRecent(values []ReplicaValue) (ReplicaValue, bool) {
 	if len(values) == 0 {
 		return ReplicaValue{}, false
@@ -253,7 +453,8 @@ func GetMostRecent(values []ReplicaValue) (ReplicaValue, bool) {
 
 	mostRecent := values[0]
 	for _, v := range values[1:] {
-		if v.Timestamp > mostRecent.Timestamp {
+		// use hlc comparison for proper causality tracking
+		if v.HLC.HappensAfter(mostRecent.HLC) {
 			mostRecent = v
 		}
 	}

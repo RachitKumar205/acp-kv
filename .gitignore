@@ -16,6 +16,9 @@ dist/
 # Dependency directories
 vendor/
 
+# Analysis tools
+benchmark/Analysis
+
 # Go workspace file
 go.work
 
@@ -38,3 +41,6 @@ Thumbs.db
 
 # Environment
 .env
+
+# Internal Documentation
+internal-docs/
