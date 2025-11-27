@@ -5,7 +5,6 @@
 *.so
 *.dylib
 bin/
-cmd/acp-adaptive-bench/acp-adaptive-bench
 dist/
 
 # Test binary
