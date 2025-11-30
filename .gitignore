@@ -18,7 +18,7 @@ dist/
 vendor/
 
 # Analysis tools
-benchmark/Analysis
+benchmark/analysis
 
 # Go workspace file
 go.work

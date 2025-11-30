@@ -1,0 +1,7 @@
+
+=== PARTITION IMPACT METRICS ===
+Failed Operations:      122
+Potential Unavailability: ~0-120s (partition window)
+AP System Note: Writes accepted with eventual consistency
+
+See run.log for detailed error timeline

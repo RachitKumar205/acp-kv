@@ -103,6 +103,19 @@ func (db *acpDB) Read(ctx context.Context, table string, key string, fields []st
 		return nil, fmt.Errorf("acp get failed: %w", err)
 	}
 
+	// check response for errors
+	if resp.Error != "" {
+		return nil, fmt.Errorf("acp get error: %s", resp.Error)
+	}
+
+	// If key not found, return empty result (YCSB expects this, not an error)
+	if !resp.Found {
+		return make(map[string][]byte), nil
+	}
+
+	// Note: We accept stale reads for benchmarking purposes
+	// In production, you might want to reject or retry on IsStale
+
 	// decode json-encoded field map
 	var result map[string][]byte
 	if err := json.Unmarshal(resp.Value, &result); err != nil {
@@ -143,13 +156,22 @@ func (db *acpDB) Insert(ctx context.Context, table string, key string, values ma
 	}
 
 	// call acp put rpc
-	_, err = client.Put(ctx, &pb.PutRequest{
+	resp, err := client.Put(ctx, &pb.PutRequest{
 		Key:   getRowKey(table, key),
 		Value: data,
 	})
 
 	if err != nil {
 		return fmt.Errorf("acp put failed: %w", err)
+	}
+
+	// check response for errors
+	if resp.Error != "" {
+		return fmt.Errorf("acp put error: %s", resp.Error)
+	}
+
+	if !resp.Success {
+		return fmt.Errorf("acp put unsuccessful (no specific error provided)")
 	}
 
 	return nil

@@ -1,0 +1,8 @@
+
+=== PARTITION IMPACT METRICS ===
+Failed Operations:       37
+Potential Unavailability: ~0-120s (partition window)
+Rejected Writes (CP system):        0
+Staleness: Check ACP Prometheus metrics (acp_staleness_seconds)
+
+See run.log for detailed error timeline

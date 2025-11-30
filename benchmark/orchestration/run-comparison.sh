@@ -11,6 +11,7 @@
 # Options:
 #   --scenarios SCENARIO_LIST   Comma-separated scenarios (baseline,degraded,partition,high-load)
 #   --systems SYSTEM_LIST       Comma-separated systems (acp,redis,etcd)
+#   --workloads WORKLOAD_LIST   Comma-separated workloads (workloada,workloadb,workloadc)
 #   --output-dir DIR            Output directory for results
 #   --skip-teardown             Don't tear down clusters after benchmarks
 #
@@ -20,6 +21,7 @@ set -e  # Exit on error
 # Default configuration
 SCENARIOS="baseline,degraded,partition,high-load"
 SYSTEMS="acp"  # TODO: Add redis,etcd support (requires go-ycsb + unified metrics)
+WORKLOADS="workloada,workloadb"  # Test both write-heavy and read-heavy for rigor
 OUTPUT_DIR="../results/comparison"
 SKIP_TEARDOWN=false
 
@@ -32,6 +34,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --systems)
             SYSTEMS="$2"
+            shift 2
+            ;;
+        --workloads)
+            WORKLOADS="$2"
             shift 2
             ;;
         --output-dir)
@@ -52,13 +58,13 @@ done
 # Convert comma-separated strings to arrays
 IFS=',' read -r -a SCENARIO_ARRAY <<< "$SCENARIOS"
 IFS=',' read -r -a SYSTEM_ARRAY <<< "$SYSTEMS"
+IFS=',' read -r -a WORKLOAD_ARRAY <<< "$WORKLOADS"
 
-# Validate systems (only ACP supported currently)
+# Validate systems
 for system in "${SYSTEM_ARRAY[@]}"; do
-    if [[ "$system" != "acp" ]]; then
-        echo "ERROR: System '$system' not yet supported"
-        echo "Currently only 'acp' is supported. Redis/etcd require additional infrastructure."
-        echo "See benchmark/README.md for details."
+    if [[ "$system" != "acp" && "$system" != "redis" && "$system" != "etcd" ]]; then
+        echo "ERROR: Unknown system '$system'"
+        echo "Supported systems: acp, redis, etcd"
         exit 1
     fi
 done
@@ -71,6 +77,7 @@ echo "ACP COMPARISON BENCHMARK SUITE"
 echo "=========================================="
 echo "Scenarios: ${SCENARIO_ARRAY[*]}"
 echo "Systems: ${SYSTEM_ARRAY[*]}"
+echo "Workloads: ${WORKLOAD_ARRAY[*]}"
 echo "Output: $OUTPUT_DIR"
 echo ""
 
@@ -83,21 +90,38 @@ deploy_system() {
     local system=$1
     echo "[$(date +%T)] Deploying $system..."
 
-    if [[ "$system" != "acp" ]]; then
-        echo "Error: Only ACP is currently supported"
-        return 1
-    fi
-
-    kubectl apply -f "$SCRIPT_DIR/../../k8s/statefulset.yaml"
-    kubectl apply -f "$SCRIPT_DIR/../../k8s/services.yaml"
-
-    echo "[$(date +%T)] Waiting for ACP pods to be ready..."
-    kubectl wait --for=condition=ready pod -l app=acp-node --timeout=120s
-
-    # Additional stabilization delay
-    sleep 10
-
-    echo "[$(date +%T)] ACP deployment complete"
+    case $system in
+        acp)
+            # Apply services first so DNS is available when pods start
+            kubectl apply -f "$SCRIPT_DIR/../../k8s/services.yaml"
+            kubectl apply -f "$SCRIPT_DIR/../../k8s/statefulset.yaml"
+            echo "[$(date +%T)] Waiting for ACP pods to be ready..."
+            kubectl wait --for=condition=ready pod -l app=acp-node --timeout=120s
+            # Extra wait for inter-node connections to establish
+            sleep 15
+            echo "[$(date +%T)] ACP deployment complete"
+            ;;
+        redis)
+            kubectl apply -f "$COMPARE_DIR/redis/statefulset.yaml"
+            echo "[$(date +%T)] Waiting for Redis pods to be ready..."
+            kubectl wait --for=condition=ready pod -l app=redis-bench --timeout=120s
+            sleep 5
+            echo "[$(date +%T)] Initializing Redis cluster..."
+            "$COMPARE_DIR/redis/init-cluster.sh"
+            echo "[$(date +%T)] Redis deployment complete"
+            ;;
+        etcd)
+            kubectl apply -f "$COMPARE_DIR/etcd/statefulset.yaml"
+            echo "[$(date +%T)] Waiting for etcd pods to be ready..."
+            kubectl wait --for=condition=ready pod -l app=etcd-bench --timeout=120s
+            sleep 10
+            echo "[$(date +%T)] etcd deployment complete"
+            ;;
+        *)
+            echo "Error: Unknown system: $system"
+            return 1
+            ;;
+    esac
 }
 
 # Function to teardown a system
@@ -105,13 +129,22 @@ teardown_system() {
     local system=$1
     echo "[$(date +%T)] Tearing down $system..."
 
-    if [[ "$system" != "acp" ]]; then
-        echo "Error: Only ACP is currently supported"
-        return 1
-    fi
-
-    kubectl delete -f "$SCRIPT_DIR/../../k8s/statefulset.yaml" --ignore-not-found=true
-    kubectl delete -f "$SCRIPT_DIR/../../k8s/services.yaml" --ignore-not-found=true
+    case $system in
+        acp)
+            kubectl delete -f "$SCRIPT_DIR/../../k8s/statefulset.yaml" --ignore-not-found=true
+            kubectl delete -f "$SCRIPT_DIR/../../k8s/services.yaml" --ignore-not-found=true
+            ;;
+        redis)
+            kubectl delete -f "$COMPARE_DIR/redis/statefulset.yaml" --ignore-not-found=true
+            ;;
+        etcd)
+            kubectl delete -f "$COMPARE_DIR/etcd/statefulset.yaml" --ignore-not-found=true
+            ;;
+        *)
+            echo "Error: Unknown system: $system"
+            return 1
+            ;;
+    esac
 
     # Wait for pods to be deleted
     sleep 5
@@ -121,71 +154,51 @@ teardown_system() {
 run_benchmark() {
     local system=$1
     local scenario=$2
-    local output_file=$3
+    local workload=$3
+    local output_file=$4
 
-    echo "[$(date +%T)] Running $scenario benchmark on $system..."
+    echo "[$(date +%T)] Running $scenario benchmark on $system with $workload..."
 
     # Create system output directory
     local system_output_dir="$OUTPUT_DIR/$system"
     mkdir -p "$system_output_dir"
 
-    # Create scenario-specific output directory
-    local scenario_output="$system_output_dir/$scenario"
+    # Create scenario-specific output directory (include workload in path)
+    local scenario_output="$system_output_dir/$scenario-$workload"
     mkdir -p "$scenario_output"
 
-    # Run scenario-specific benchmark (pass output dir as 3rd param)
+    # Run YCSB scenario (pass system as first param, workload as third)
     case $scenario in
         baseline)
-            "$SCRIPT_DIR/scenarios/baseline.sh" 120 workloada "$scenario_output" > "$system_output_dir/baseline.log" 2>&1
+            "$SCRIPT_DIR/scenarios-ycsb/baseline.sh" "$system" 120 "$workload" "$scenario_output" > "$system_output_dir/$scenario-$workload.log" 2>&1
             ;;
         degraded)
-            "$SCRIPT_DIR/scenarios/degraded-latency.sh" 180 workloada "$scenario_output" > "$system_output_dir/degraded.log" 2>&1
+            "$SCRIPT_DIR/scenarios-ycsb/degraded.sh" "$system" 180 "$workload" "$scenario_output" > "$system_output_dir/$scenario-$workload.log" 2>&1
             ;;
         partition)
-            "$SCRIPT_DIR/scenarios/partition.sh" 240 workloada "$scenario_output" > "$system_output_dir/partition.log" 2>&1
+            "$SCRIPT_DIR/scenarios-ycsb/partition.sh" "$system" 240 "$workload" "$scenario_output" > "$system_output_dir/$scenario-$workload.log" 2>&1
             ;;
         high-load)
-            "$SCRIPT_DIR/scenarios/high-load.sh" 120 workloada "$scenario_output" > "$system_output_dir/high-load.log" 2>&1
+            "$SCRIPT_DIR/scenarios-ycsb/high-load.sh" "$system" 120 "$workload" "$scenario_output" > "$system_output_dir/$scenario-$workload.log" 2>&1
             ;;
         *)
-            echo "Error: Unknown scenario: $scenario"
+            echo "Error: Unknown scenario '$scenario'"
+            echo "Supported scenarios: baseline, degraded, partition, high-load"
             return 1
             ;;
     esac
 
-    # Export metrics to CSV
-    echo "[$(date +%T)] Exporting metrics for $system/$scenario..."
+    # Copy YCSB metrics to output file
+    echo "[$(date +%T)] Copying metrics for $system/$scenario/$workload..."
 
-    if [[ "$system" != "acp" ]]; then
-        echo "Error: Only ACP metrics export is currently supported"
-        return 1
+    if [ -f "$scenario_output/metrics.txt" ]; then
+        cp "$scenario_output/metrics.txt" "$output_file"
+        echo "[$(date +%T)] Metrics saved to: $output_file"
+    else
+        echo "[$(date +%T)] Warning: No metrics file found at $scenario_output/metrics.txt"
     fi
 
-    # ACP exposes Prometheus metrics on each node
-    echo "[$(date +%T)] Starting port-forward to ACP node..."
-    kubectl port-forward acp-node-0 9090:9090 > /dev/null 2>&1 &
-    local pf_pid=$!
-    sleep 3
-
-    # Export using Prometheus export tool
-    cd "$SCRIPT_DIR/../analysis"
-
-    # macOS-compatible date commands
-    local start_time=$(date -u -v-5M +%Y-%m-%dT%H:%M:%SZ)
-    local end_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-    go run export-prometheus.go \
-        --prometheus-url="http://localhost:9090" \
-        --output="$output_file" \
-        --start="$start_time" \
-        --end="$end_time" || true  # Ignore exit code, check if file was created
-
-    # Kill port-forward
-    if [ -n "$pf_pid" ]; then
-        kill $pf_pid 2>/dev/null || true
-    fi
-
-    echo "[$(date +%T)] Benchmark complete: $output_file"
+    echo "[$(date +%T)] Benchmark complete"
 }
 
 # Main execution loop
@@ -200,13 +213,15 @@ for system in "${SYSTEM_ARRAY[@]}"; do
     # Deploy system
     deploy_system "$system"
 
-    # Run each scenario
+    # Run each scenario with each workload
     for scenario in "${SCENARIO_ARRAY[@]}"; do
-        output_file="$OUTPUT_DIR/$system/$scenario.csv"
-        run_benchmark "$system" "$scenario" "$output_file"
+        for workload in "${WORKLOAD_ARRAY[@]}"; do
+            output_file="$OUTPUT_DIR/$system/$scenario-$workload.csv"
+            run_benchmark "$system" "$scenario" "$workload" "$output_file"
 
-        # Brief cooldown between scenarios
-        sleep 5
+            # Brief cooldown between runs
+            sleep 5
+        done
     done
 
     # Teardown (unless skipped)

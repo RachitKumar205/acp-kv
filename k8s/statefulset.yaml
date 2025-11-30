@@ -18,6 +18,10 @@ spec:
       - name: acp-node
         image: acp-kv:latest
         imagePullPolicy: Never
+        securityContext:
+          capabilities:
+            add:
+            - NET_ADMIN  # Required for network partition tests (tc command)
         ports:
         - containerPort: 8080
           name: grpc
@@ -81,8 +85,9 @@ spec:
         # HLC and staleness configuration
         - name: HLC_MAX_DRIFT
           value: "500ms"
+        # Set high MAX_STALENESS for benchmarking (staleness checks still apply during partitions)
         - name: MAX_STALENESS
-          value: "3s"
+          value: "1h"
         - name: RECONCILIATION_ENABLED
           value: "true"
         - name: RECONCILIATION_INTERVAL
@@ -103,5 +108,5 @@ spec:
             cpu: "100m"
             memory: "128Mi"
           limits:
-            cpu: "500m"
+            cpu: "1000m"  # Pin to 1 CPU core for fair comparison
             memory: "512Mi"

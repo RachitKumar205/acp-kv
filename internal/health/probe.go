@@ -71,7 +71,9 @@ func (p *Probe) addPeer(addr string) error {
 		return nil
 	}
 
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	// Use dns:/// scheme for Kubernetes DNS resolution
+	target := "dns:///" + addr
+	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return err
 	}
